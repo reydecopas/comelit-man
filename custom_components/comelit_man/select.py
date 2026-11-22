@@ -34,15 +34,13 @@ async def async_setup_entry(
 class ComelitCameraSelector(ComelitEntity, SelectEntity):
     """Select which entrance camera (and door) the panel streams and opens.
 
-    Panel routing model (field-observed 2026-11-16): rings route the relay
-    to whichever panel called; fresh outbound calls always answer on cam1
-    (the panel's natural state); only a call made while the previous one is
-    still held advances the relay to the other camera. Selecting an option
-    therefore starts a session if none is running and toggles at most once.
-    Which physical camera is streaming is identified by its RTP SSRC
-    (fresh per call — the origin expectation anchors it); the user labels
-    the two slots ("urbanización"/"casa") via the options flow, since the
-    camera↔door mapping is not stable across power cuts.
+    Panel routing model (field-observed 2026-11-20): the relay position is
+    physical state the panel never reports, and every new call advances it
+    one step (with the mobile subaddress), so the panel that answers cannot
+    be assumed. The first decoded frame of each session is fingerprinted and
+    compared against one reference per slot; that identification — persisted
+    across restarts — is what this entity shows. Selecting an option starts
+    a session if none is running and toggles at most once towards it.
     """
 
     _attr_translation_key = "camera_selector"
@@ -74,29 +72,32 @@ class ComelitCameraSelector(ComelitEntity, SelectEntity):
     async def async_select_option(self, option: str) -> None:
         """Reach the requested camera with at most one selector toggle.
 
-        Panel model (field-observed 2026-11-16): from its natural state the
-        panel answers every fresh call on cam1, and only a call made while
-        the previous one is still held advances the relay. So reaching the
-        non-natural camera needs a live session first — start one, and if
-        the panel answered on the requested camera we are done, otherwise
-        one toggle advances the relay.
+        Panel model (field-observed 2026-11-20): a call advances the relay
+        one step, so reaching a camera needs a live session first — start
+        one, wait for its first frame to be identified, and toggle once only
+        when the confirmed panel is not the requested one. When the view is
+        inconclusive the relay is advanced anyway (this is manual control and
+        the live image is the ground truth), with a warning.
         """
         slot = self.coordinator.slot_for_label(option)
         if slot is None:
             _LOGGER.warning("Unknown camera option: %s", option)
             return
         session = self.coordinator.video_session
-        if (
-            self.coordinator.active_camera_slot == slot
-            and session is not None
-            and session.active
-        ):
-            _LOGGER.debug("Camera %s (%s) already selected", option, slot)
-            return
         if session is None or not session.active:
             await self.coordinator.async_start_video(auto_timeout=True, by_user=True)
-            if self.coordinator.active_camera_slot == slot:
-                return
+        confidence = await self.coordinator.async_wait_for_route()
+        if confidence in ("unknown", "fallback", "timeout"):
+            _LOGGER.warning(
+                "Camera selector: could not verify the streaming panel (%s) — "
+                "advancing the relay once; check the live view",
+                confidence,
+            )
+            await self.coordinator.async_toggle_camera_selection()
+            return
+        if self.coordinator.active_camera_slot == slot:
+            _LOGGER.debug("Camera %s (%s) already selected", option, slot)
+            return
         await self.coordinator.async_toggle_camera_selection()
 
     @property
@@ -107,6 +108,11 @@ class ComelitCameraSelector(ComelitEntity, SelectEntity):
             "video_ssrc": self.coordinator.camera_ssrc,
             "slot_map": {
                 f"0x{ssrc:08X}": slot for ssrc, slot in self.coordinator.camera_slot_map.items()
+            },
+            "route_identification_pending": self.coordinator.route_identification_pending,
+            "route_references": {
+                slot: f"0x{reference:016X}"
+                for slot, reference in self.coordinator.route_references.items()
             },
         }
 

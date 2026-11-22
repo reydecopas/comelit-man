@@ -20,6 +20,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .auth import authenticate
@@ -40,6 +41,7 @@ from .exceptions import AuthenticationError, DoorOpenError
 from .go2rtc_helper import get_go2rtc
 from .models import DeviceConfig, Door, PushEvent
 from .push import register_push, send_push_keepalive
+from .route_identifier import LEARN_DISTANCE, fingerprint, hamming, identify
 from .rtsp_server import LocalRtspServer
 from .video_call import VideoCallSession
 from .vip_listener import VipEventListener
@@ -55,16 +57,24 @@ RING_DEDUP_WINDOW = 120.0
 # a ring this recently; otherwise it is video-teardown / CTPP-init tail.
 MISSED_CALL_WINDOW = 45.0
 # Hardware settling cooldown between video sessions (seconds).
-RELAY_SETTLE_COOLDOWN = 1.5
+# Field-measured 2026-11-20: 1.5 s makes the panel serve a corrupt stream
+# after a selector switch; 3 s worked, 5-6 s leaves a safe margin.
+RELAY_SETTLE_COOLDOWN = 5.5
+
+# Entrance route persistence: the relay position is physical state the panel
+# does not report, so it survives integration restarts. One fingerprint per
+# camera slot is learned from the first frame of each panel.
+ROUTE_STORE_VERSION = 1
+ROUTE_SLOTS = ("cam1", "cam2")
+# How many decoded frames an unidentified session may consume before the
+# route stays "unknown" (a corrupt first frame after a switch is common).
+ROUTE_ID_MAX_ATTEMPTS = 3
 
 # open_entrance choreography: how long to wait for the (new) camera's first
 # video SSRC after a start/toggle, and how often to poll the active slot.
-CAMERA_SWITCH_TIMEOUT = 12.0
+# The 5.5 s relay settle plus panel re-arm fits comfortably in this window.
+CAMERA_SWITCH_TIMEOUT = 20.0
 CAMERA_WAIT_POLL = 0.25
-# The panel's natural state routes camera 1: after its call lease expires
-# (the same ~120 s window that produces missed_call) the relay returns
-# there, so the selector display reverts to cam1 once the panel idles out.
-CAMERA_IDLE_REVERT_DELAY = 120.0
 
 
 def _assign_camera_slot(seen: dict[int, str], active: str | None, ssrc: int) -> str:
@@ -193,6 +203,25 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         # assigned ("cam1" for outbound starts, the advance for toggles).
         # Consumed by _on_video_ssrc on the session's first SSRC.
         self._camera_expectation: str | None = None
+        # Entrance route identification (2026-11-20). The relay position is
+        # physical state the panel never reports, and the RTP SSRC is re-armed
+        # on every call, so neither says which entrance is streaming. The view
+        # does: one dHash per slot, compared against the session's first
+        # decoded frame. References and the last known route are persisted, so
+        # the selector survives restarts instead of assuming "cam1".
+        self._route_store: Store[dict[str, Any]] = Store(
+            hass, ROUTE_STORE_VERSION, f"{DOMAIN}.route.{entry.entry_id}"
+        )
+        self._route_refs: dict[str, int] = {}
+        self._route_store_loaded: bool = False
+        self._route_id_pending: bool = False
+        self._route_id_done: bool = False
+        self._route_id_attempts: int = 0
+        # How the current slot was decided: "measured" (reference match),
+        # "learned" (second entrance seen for the first time), "bootstrap"
+        # (first reference, trusting the panel's idle default), "fallback"
+        # (armed expectation after an inconclusive frame) or "unknown".
+        self._route_confidence: str = "unknown"
         self._last_video_stop_mono: float = 0.0  # hardware settling timestamp
         self._auto_restart_timestamps: list[float] = []  # rate-limit auto-restarts
 
@@ -242,6 +271,10 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
 
     async def async_setup(self) -> None:
         """Connect, authenticate, fetch config, and register for push."""
+        # Restore the last known entrance route before any entity is added,
+        # so the selector shows the panel that is really routed instead of
+        # the panel's power-on default.
+        await self._ensure_route_store_loaded()
         client = IconaBridgeClient(self.host, self.port)
         await client.connect()
         try:
@@ -427,6 +460,16 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         return dict(self._camera_slots)
 
     @property
+    def route_references(self) -> dict[str, int]:
+        """Return the per-slot frame fingerprints used to identify the route."""
+        return dict(self._route_refs)
+
+    @property
+    def route_identification_pending(self) -> bool:
+        """True while the session's first frame has not been identified yet."""
+        return self._route_id_pending
+
+    @property
     def camera_slot_changed_at(self) -> float | None:
         """Return the monotonic time of the last camera-slot change."""
         return self._camera_slot_mono
@@ -450,14 +493,17 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
 
         Called by the active session's RtpReceiver whenever the video SSRC
         changes (including the first video packet of a session). The panel
-        re-arms its encoder per call, so SSRCs are effectively unique per
-        session and the learned map almost never hits — the slot for a new
-        SSRC comes from the session's origin expectation when armed
-        (outbound starts answer on cam1; a toggle made while the previous
-        call is still held advances the relay), falling back to the
-        alternating guess for inbound rings, whose camera we cannot know
-        in advance (the panel routes the relay to whichever panel called).
+        re-arms its encoder per call, so SSRCs are unique per session and
+        cannot identify a physical panel; they only anchor the session to a
+        slot. The real entrance comes from the frame fingerprint
+        (_identify_route), which runs before this hook: while it is pending
+        the slot is left alone rather than guessed.
         """
+        if self._route_id_pending:
+            # First frame's fingerprint decides — do not overwrite the real
+            # route with the SSRC alternation in the meantime.
+            self._camera_ssrc = ssrc
+            return
         known = self._camera_slots.get(ssrc)
         if known is not None:
             new_slot = known
@@ -469,38 +515,237 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         self._camera_ssrc = ssrc
         if new_slot != self._active_camera_slot:
             self._camera_slots[ssrc] = new_slot
-            self._active_camera_slot = new_slot
-            self._camera_slot_mono = time.monotonic()
-            _LOGGER.info("Camera selector: active camera is now %s (ssrc=0x%08X)", new_slot, ssrc)
-            self.config_entry.async_create_background_task(
-                self.hass,
-                self._notify_video_state_change(),
-                "comelit-camera-slot-change",
+            self._set_active_slot(new_slot, source=f"ssrc 0x{ssrc:08X}")
+        elif ssrc not in self._camera_slots:
+            self._camera_slots[ssrc] = new_slot
+
+    def _set_active_slot(self, slot: str, *, source: str) -> None:
+        """Publish a camera slot change to the entities and persist the route."""
+        self._active_camera_slot = slot
+        self._camera_slot_mono = time.monotonic()
+        _LOGGER.info("Camera selector: active camera is now %s (%s)", slot, source)
+        self.config_entry.async_create_background_task(
+            self.hass,
+            self._notify_video_state_change(),
+            "comelit-camera-slot-change",
+        )
+
+    def _begin_route_identification(self) -> None:
+        """Let the next session's first decoded frames decide the active slot."""
+        self._route_id_pending = True
+        self._route_id_done = False
+        self._route_id_attempts = 0
+        self._route_confidence = "unknown"
+
+    def _on_video_frame(self, sample: int) -> None:
+        """Fingerprint callback: identify the entrance from the next frame."""
+        if self._route_id_done:
+            return
+        self._route_id_done = True
+        self.config_entry.async_create_background_task(
+            self.hass,
+            self._identify_route(sample),
+            "comelit-route-identify",
+        )
+
+    async def async_wait_for_route(self, timeout: float | None = None) -> str:
+        """Wait (bounded) for the active entrance to be identified.
+
+        Returns the decision confidence: "measured", "learned", "bootstrap",
+        "fallback", "unknown" or "timeout". Entities use it before acting on
+        the slot, so a stale route never drives a switch or a door strike.
+        """
+        return await self._wait_for_route_identification(timeout)
+
+    async def _wait_for_route_identification(
+        self, timeout: float | None = None
+    ) -> str:
+        """Wait until the session's first frame has been identified.
+
+        Returns the decision confidence ("measured", "learned", "bootstrap",
+        "fallback", "unknown") or "timeout" when no frame was fingerprinted
+        within ``timeout`` seconds (module default when omitted).
+        """
+        if timeout is None:
+            timeout = CAMERA_SWITCH_TIMEOUT
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self._route_id_pending:
+                return self._route_confidence
+            await asyncio.sleep(CAMERA_WAIT_POLL)
+        _LOGGER.warning("Entrance route: no identifiable frame within %.0fs", timeout)
+        return "timeout"
+
+    async def _identify_route(self, sample: int) -> None:
+        """Assign the active slot from a frame fingerprint.
+
+        Order of confidence: a reference match wins ("measured"); with no
+        references the current display is learned as the first one
+        ("bootstrap"); with exactly one reference a clearly different view is
+        the other entrance and is learned ("learned"). An inconclusive frame
+        is retried with the next one; when the budget runs out the armed
+        expectation is kept ("fallback") or nothing is claimed ("unknown") —
+        a wrong slot would strike the wrong door.
+        """
+        await self._ensure_route_store_loaded()
+        self._route_id_attempts += 1
+        slot, distance = identify(sample, self._route_refs)
+        confidence = "measured"
+        if slot is None and not self._route_refs:
+            bootstrap = self._active_camera_slot or "cam1"
+            self._route_refs[bootstrap] = sample
+            slot = bootstrap
+            distance = 0
+            confidence = "bootstrap"
+            _LOGGER.info(
+                "Entrance route: learned the first reference for %s — "
+                "use comelit_man.calibrate_camera if the label is wrong",
+                bootstrap,
             )
+        elif slot is None and len(self._route_refs) == 1:
+            known_slot, known_ref = next(iter(self._route_refs.items()))
+            if hamming(sample, known_ref) >= LEARN_DISTANCE:
+                missing = "cam2" if known_slot == "cam1" else "cam1"
+                self._route_refs[missing] = sample
+                slot = missing
+                distance = hamming(sample, known_ref)
+                confidence = "learned"
+                _LOGGER.info(
+                    "Entrance route: learned the second reference for %s "
+                    "(distance %d from %s)",
+                    missing,
+                    distance,
+                    known_slot,
+                )
+        if slot is None:
+            if self._route_id_attempts < ROUTE_ID_MAX_ATTEMPTS:
+                # Usually a corrupt frame right after the relay settled —
+                # let the next decoded frame try again.
+                self._route_id_done = False
+                _LOGGER.debug(
+                    "Entrance route: frame %d inconclusive (best distance %s)",
+                    self._route_id_attempts,
+                    distance,
+                )
+                return
+            fallback = self._camera_expectation
+            self._camera_expectation = None
+            if fallback is not None:
+                self._set_active_slot(fallback, source="expectation fallback")
+            confidence = "fallback" if fallback is not None else "unknown"
+            _LOGGER.warning(
+                "Entrance route: could not identify the streaming panel "
+                "after %d frames (best distance %s) — %s",
+                self._route_id_attempts,
+                distance,
+                f"assuming {fallback}" if fallback else "route unknown",
+            )
+        else:
+            self._camera_expectation = None
+            if slot != self._active_camera_slot:
+                self._set_active_slot(
+                    slot, source=f"identified ({confidence}, distance {distance})"
+                )
+            else:
+                _LOGGER.debug(
+                    "Entrance route: confirmed %s (%s, distance %s)",
+                    slot,
+                    confidence,
+                    distance,
+                )
+            if self._camera_ssrc is not None:
+                self._camera_slots[self._camera_ssrc] = slot
+        self._route_confidence = confidence
+        self._route_id_pending = False
+        await self._save_route_state()
+
+    async def async_calibrate_camera(self, label: str) -> None:
+        """Store the live view as the reference for a camera slot.
+
+        Use it after relabeling the entrances, after a panel power cut, or
+        when the automatic first-sight learning picked the wrong slot.
+        """
+        slot = self.slot_for_label(label)
+        if slot is None:
+            raise RuntimeError(f"Unknown entrance label: {label!r}")
+        session = self._video_session
+        if session is None or not session.active or session.rtp_receiver is None:
+            raise RuntimeError("No active video session — start the camera first")
+        jpeg = session.rtp_receiver.latest_frame
+        if not jpeg:
+            raise RuntimeError("No decoded frame yet — try again in a second")
+        sample = await self.hass.async_add_executor_job(fingerprint, jpeg)
+        if sample is None:
+            raise RuntimeError("Could not read the current frame")
+        await self._ensure_route_store_loaded()
+        self._route_refs[slot] = sample
+        self._route_id_pending = False
+        self._route_id_done = True
+        self._route_confidence = "measured"
+        self._set_active_slot(slot, source="calibrated from the live frame")
+        await self._save_route_state()
+        _LOGGER.info("Entrance route: calibrated %s (%s)", slot, label)
+
+    async def _ensure_route_store_loaded(self) -> None:
+        """Restore the last known route and the reference fingerprints."""
+        if self._route_store_loaded:
+            return
+        self._route_store_loaded = True
+        try:
+            data = await self._route_store.async_load()
+        except Exception:
+            _LOGGER.debug("Could not load the entrance route state", exc_info=True)
+            return
+        if not data:
+            return
+        slot = data.get("slot")
+        if slot in ROUTE_SLOTS:
+            self._active_camera_slot = slot
+        refs = data.get("refs") or {}
+        self._route_refs = {
+            key: int(value)
+            for key, value in refs.items()
+            if key in ROUTE_SLOTS and isinstance(value, int | float)
+        }
+        _LOGGER.debug(
+            "Entrance route restored: slot=%s, references=%s",
+            self._active_camera_slot,
+            sorted(self._route_refs),
+        )
+
+    async def _save_route_state(self) -> None:
+        """Persist the route and references so a restart does not guess."""
+        try:
+            await self._route_store.async_save(
+                {
+                    "slot": self._active_camera_slot,
+                    "refs": dict(self._route_refs),
+                }
+            )
+        except Exception:
+            _LOGGER.debug("Could not persist the entrance route state", exc_info=True)
 
     def _arm_outbound_camera_expectation(self) -> None:
-        """Arm the first-SSRC expectation for an outbound (non-toggle) start.
+        """Prepare route identification for an outbound (non-toggle) start.
 
-        The panel answers a fresh call on its natural camera (cam1) — the
-        relay cannot be advanced from idle with a single call. The display
-        is corrected to cam1 immediately so the dropdown matches what the
-        user is about to see.
+        A fresh call does not reset the relay: it answers on whichever panel
+        is currently routed, and with the mobile subaddress every call
+        advances it one step (field-observed 2026-11-20). So the display
+        keeps the last known route and the first frame's fingerprint decides;
+        the armed expectation is only the fallback when identification fails.
         """
         if self._camera_expectation is None:
-            self._camera_expectation = "cam1"
-        if self._active_camera_slot != "cam1":
-            self._active_camera_slot = "cam1"
-            self._camera_slot_mono = time.monotonic()
-            _LOGGER.info("Camera selector: outbound start — panel answers on cam1 (natural state)")
+            self._camera_expectation = self._active_camera_slot
+        self._begin_route_identification()
 
     async def async_toggle_camera_selection(self) -> str | None:
         """Advance (or re-anchor) the entrance panel's camera/door routing.
 
-        Panel model (field-observed 2026-11-16): a call made while the
-        previous one is still held advances the selector relay to the other
-        camera — that is how camera switching works. A fresh call from the
-        panel's natural state answers on cam1 (the manual-start case); the
-        relay cannot be advanced from idle with a single call.
+        Panel model (field-observed 2026-11-20): every new call advances the
+        selector relay one step (with the mobile subaddress), and a fresh
+        call from idle answers on whichever panel is routed — neither is
+        predictable from the protocol, so the next session's first frame is
+        fingerprinted to learn where the relay really is.
 
         Returns the active slot after the toggle ("cam1"/"cam2"), or None
         if the new camera's SSRC hasn't been seen yet.
@@ -515,29 +760,12 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
             # Call held live → the panel advances the relay to the other camera.
             self._camera_expectation = {"cam1": "cam2", "cam2": "cam1"}.get(pre)
         else:
-            # From the natural state a fresh call answers on cam1.
-            self._camera_expectation = "cam1" if pre in ("cam1", "cam2") else None
+            # From idle, keep the last known route and let the first frame
+            # decide; "cam1" is only the bootstrap when nothing is known yet.
+            self._camera_expectation = pre if pre in ("cam1", "cam2") else "cam1"
+        self._begin_route_identification()
         await self.async_start_video(auto_timeout=True, by_user=True, force_restart=True)
         return self._active_camera_slot
-
-    async def _wait_for_active_camera_slot(
-        self,
-        target: str | None = None,
-        timeout: float = CAMERA_SWITCH_TIMEOUT,
-    ) -> str | None:
-        """Wait for the active camera slot to be known (and match target if given).
-
-        The slot is assigned by _on_video_ssrc when the first video packet of
-        the (new) session arrives. With ``target`` set, resolves only when the
-        routed camera matches; returns None on timeout.
-        """
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            slot = self._active_camera_slot
-            if slot is not None and (target is None or slot == target):
-                return slot
-            await asyncio.sleep(CAMERA_WAIT_POLL)
-        return self._active_camera_slot if target is None else None
 
     async def async_open_entrance(
         self, label: str, *, stop_after: bool = False, relay: int | None = None
@@ -549,11 +777,12 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         urbanización" can never strike the wrong door:
 
         1. Resolve ``label`` to a camera slot via the configured labels.
-        2. Ensure a video session is running and its camera is identified.
+        2. Ensure a video session is running and its first frame has been
+           fingerprinted; refuse to open when the view is inconclusive.
         3. While the active slot differs from the target: advance the selector
            (one stop + force-restart call = one relay click) and wait for the
-           new camera's SSRC. Bounded to 3 advances (two slots + margin) so a
-           misbehaving panel cannot hammer the relay.
+           new view to be identified. Bounded to 3 advances (two slots plus
+           margin) so a misbehaving panel cannot hammer the relay.
         4. Fire the door relay on the active call (0x1840/0x000D when video is
            flowing; the standard open path otherwise).
         5. ``stop_after`` ends the session; by default it stays on (its own
@@ -568,10 +797,17 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         session = self._video_session
         if session is None or not session.active:
             await self.async_start_video(auto_timeout=True, by_user=True)
-            if await self._wait_for_active_camera_slot(timeout=CAMERA_SWITCH_TIMEOUT) is None:
-                raise RuntimeError(
-                    "Camera did not start streaming — cannot determine the active entrance"
-                )
+        confidence = await self._wait_for_route_identification()
+        if self._active_camera_slot is None:
+            raise RuntimeError(
+                "Camera did not start streaming — cannot determine the active entrance"
+            )
+        if confidence in ("unknown", "fallback", "timeout"):
+            raise RuntimeError(
+                "Could not verify which entrance is routed "
+                f"({confidence}) — not opening. Calibrate with "
+                "comelit_man.calibrate_camera or check the camera view."
+            )
 
         for attempt in range(3):
             if self._active_camera_slot == target:
@@ -583,7 +819,13 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                 self._active_camera_slot,
             )
             await self.async_toggle_camera_selection()
-            if await self._wait_for_active_camera_slot(target=target) is not None:
+            confidence = await self._wait_for_route_identification()
+            if confidence in ("unknown", "fallback", "timeout"):
+                raise RuntimeError(
+                    "Could not verify the entrance after switching "
+                    f"({confidence}) — not opening."
+                )
+            if self._active_camera_slot == target:
                 break
         else:
             raise RuntimeError(
@@ -782,6 +1024,7 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                     # SSRC is already known — seed the slot tracking now and
                     # keep the hook for mid-session changes.
                     session.rtp_receiver.on_video_ssrc = self._on_video_ssrc
+                    session.rtp_receiver.on_video_frame = self._on_video_frame
                     if session.rtp_receiver.video_ssrc is not None:
                         self._on_video_ssrc(session.rtp_receiver.video_ssrc)
                 self._video_session = session
@@ -987,6 +1230,8 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                 session.rtp_receiver.attach_backchannel_queue(self._rtsp_server.backchannel_queue)
             if session.rtp_receiver is not None:
                 session.rtp_receiver.on_video_ssrc = self._on_video_ssrc
+                session.rtp_receiver.on_video_frame = self._on_video_frame
+                self._begin_route_identification()
                 if session.rtp_receiver.video_ssrc is not None:
                     self._on_video_ssrc(session.rtp_receiver.video_ssrc)
             self._video_session = session
@@ -1237,32 +1482,10 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
             await self._ensure_vip_listener()
         # A stale first-SSRC expectation must not leak into the next session.
         self._camera_expectation = None
-        # Once the panel idles out (~120 s lease, the missed_call window) its
-        # relay returns to cam1 — the selector display follows (fire-and-
-        # forget; the task re-checks that no session is active before touching
-        # the slot, so a toggle started meanwhile is not disturbed).
-        self.config_entry.async_create_background_task(
-            self.hass, self._camera_idle_revert(), "comelit-camera-idle-revert"
-        )
+        # The relay is physical state that survives the call lease: it does
+        # not snap back to cam1, so the display keeps the last identified
+        # route until the next session's first frame corrects it.
         await self._notify_video_state_change()
-
-    async def _camera_idle_revert(self) -> None:
-        """Revert the selector display to cam1 once the panel idles out.
-
-        The panel's natural state routes camera 1: fresh outbound calls
-        always answer there, and the relay returns to it when the call
-        lease expires (the same window that produces missed_call).
-        """
-        await asyncio.sleep(CAMERA_IDLE_REVERT_DELAY)
-        if self._video_start_lock.locked():
-            return
-        if self._video_session is not None and self._video_session.active:
-            return
-        if self._active_camera_slot != "cam1":
-            self._active_camera_slot = "cam1"
-            self._camera_slot_mono = time.monotonic()
-            _LOGGER.info("Camera selector: panel idle — display reverts to cam1 (natural state)")
-            await self._notify_video_state_change()
 
     @property
     def video_session(self) -> VideoCallSession | None:

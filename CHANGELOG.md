@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### New features
+
+- **Entrance route identification** — the camera selector no longer assumes cam1. The first decoded frame of every session is fingerprinted (64-bit dHash) and compared against one reference per camera slot, so the dropdown reflects the panel that is really streaming. References and the last known route persist across restarts (`.storage/comelit_man.route.*`), and the new `comelit_man.calibrate_camera` service stores the live view as a reference (use it after relabeling the entrances or after a panel power cut)
+- **`open_entrance` refuses unverified routes** — it waits for the frame identification and raises instead of firing the door relay when the view is inconclusive, so a stale or guessed route can no longer strike the wrong door
+
+### Bug fixes
+
+- **Relay settle raised to 5.5 s** — field-measured: 1.5 s made the panel serve a corrupt stream right after a selector switch (3 s worked, 5–6 s leaves margin)
+- **No more forced cam1** — a fresh call keeps the last known route instead of resetting the display, and the idle revert to cam1 is gone (the relay is physical state and does not snap back)
+
 ## 1.6.0
 
 ### New features

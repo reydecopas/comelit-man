@@ -62,6 +62,14 @@ def _make_coordinator(*, with_client: bool = False) -> ComelitLocalCoordinator:
     else:
         coordinator._client = None
     coordinator._config = MagicMock()
+    coordinator._route_refs = {}
+    coordinator._route_store_loaded = True
+    coordinator._route_store = MagicMock()
+    coordinator._route_store.async_save = AsyncMock()
+    coordinator._route_id_pending = False
+    coordinator._route_id_done = False
+    coordinator._route_id_attempts = 0
+    coordinator._route_confidence = "unknown"
     coordinator._video_session = None
     coordinator._vip_listener = None
     coordinator._video_stopped_by_user = False
@@ -1868,6 +1876,12 @@ def _make_ssrc_coordinator() -> ComelitLocalCoordinator:
     coord._camera_ssrc = None
     coord._active_camera_slot = None
     coord._camera_slot_mono = None
+    coord._route_refs = {}
+    coord._route_store_loaded = True
+    coord._route_store = MagicMock()
+    coord._route_store.async_save = AsyncMock()
+    coord._route_id_pending = False
+    coord._route_id_done = False
     return coord
 
 
@@ -1991,7 +2005,7 @@ class TestToggleCameraSelection:
 
     @pytest.mark.asyncio
     async def test_toggle_without_session_arms_cam1(self):
-        """From the panel's natural state a fresh call answers on cam1."""
+        """From idle the last known route is kept; cam1 is only the fallback."""
         coord = _make_ssrc_coordinator()
         coord._active_camera_slot = "cam1"
         coord._video_session = None
@@ -2020,12 +2034,15 @@ class TestToggleCameraSelection:
 
 class TestOutboundCameraAnchor:
     @pytest.mark.asyncio
-    async def test_anchor_arms_cam1_and_corrects_display(self):
+    async def test_anchor_keeps_the_known_route(self):
+        """A fresh call does not reset the relay, so the display must not jump to cam1."""
         coord = _make_ssrc_coordinator()
         coord._active_camera_slot = "cam2"
         coord._arm_outbound_camera_expectation()
-        assert coord._camera_expectation == "cam1"
-        assert coord._active_camera_slot == "cam1"
+        assert coord._active_camera_slot == "cam2"
+        assert coord._camera_expectation == "cam2"
+        assert coord._route_id_pending is True
+        assert coord._route_id_done is False
 
     @pytest.mark.asyncio
     async def test_anchor_keeps_existing_expectation(self):
@@ -2035,42 +2052,110 @@ class TestOutboundCameraAnchor:
         coord._arm_outbound_camera_expectation()
         assert coord._camera_expectation == "cam2"
 
-
-class TestCameraIdleRevert:
-    @pytest.fixture(autouse=True)
-    def _no_delay(self, monkeypatch):
-        import custom_components.comelit_man.coordinator as coord_mod
-
-        monkeypatch.setattr(coord_mod, "CAMERA_IDLE_REVERT_DELAY", 0.0)
-
     @pytest.mark.asyncio
-    async def test_revert_sets_cam1_when_idle(self):
+    async def test_pending_identification_blocks_the_ssrc_guess(self):
+        """While the first frame is pending, the SSRC must not overwrite the route."""
         coord = _make_ssrc_coordinator()
         coord._active_camera_slot = "cam2"
-        coord._notify_video_state_change = AsyncMock()
-        await coord._camera_idle_revert()
-        assert coord._active_camera_slot == "cam1"
-        coord._notify_video_state_change.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_revert_skips_when_session_active(self):
-        coord = _make_ssrc_coordinator()
-        coord._active_camera_slot = "cam2"
-        session = MagicMock()
-        session.active = True
-        coord._video_session = session
-        coord._notify_video_state_change = AsyncMock()
-        await coord._camera_idle_revert()
+        coord._arm_outbound_camera_expectation()
+        coord._on_video_ssrc(0x12345678)
         assert coord._active_camera_slot == "cam2"
-        coord._notify_video_state_change.assert_not_awaited()
+        assert coord._camera_ssrc == 0x12345678
 
+
+class TestRouteIdentification:
     @pytest.mark.asyncio
-    async def test_revert_noop_when_already_cam1(self):
+    async def test_first_frame_bootstraps_the_reference(self):
         coord = _make_ssrc_coordinator()
         coord._active_camera_slot = "cam1"
-        coord._notify_video_state_change = AsyncMock()
-        await coord._camera_idle_revert()
-        coord._notify_video_state_change.assert_not_awaited()
+        coord._route_id_pending = True
+
+        await coord._identify_route(0xDEADBEEF)
+
+        assert coord._route_refs == {"cam1": 0xDEADBEEF}
+        assert coord._route_id_pending is False
+
+    @pytest.mark.asyncio
+    async def test_matching_reference_moves_the_slot(self):
+        coord = _make_ssrc_coordinator()
+        coord._active_camera_slot = "cam2"
+        coord._route_refs = {"cam1": 0x0000, "cam2": 0xFFFFFFFFFFFFFFFF}
+        coord._route_id_pending = True
+
+        await coord._identify_route(0x0003)
+
+        assert coord._active_camera_slot == "cam1"
+        assert coord._route_id_pending is False
+
+    @pytest.mark.asyncio
+    async def test_unknown_second_view_is_learned(self):
+        coord = _make_ssrc_coordinator()
+        coord._active_camera_slot = "cam1"
+        coord._route_refs = {"cam1": 0x0000}
+        coord._route_id_pending = True
+
+        await coord._identify_route(0xFFFFFFFFFFFFFFFF)
+
+        assert coord._route_refs["cam2"] == 0xFFFFFFFFFFFFFFFF
+        assert coord._active_camera_slot == "cam2"
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_view_is_retried(self):
+        """A single inconclusive frame must not decide — the next one tries again."""
+        coord = _make_ssrc_coordinator()
+        coord._active_camera_slot = "cam2"
+        coord._route_refs = {"cam1": 0x0000, "cam2": 0xFFFFFFFFFFFFFFFF}
+        coord._route_id_pending = True
+
+        await coord._identify_route(0x0F0F0F0F0F0F0F0F)
+
+        assert coord._active_camera_slot == "cam2"
+        assert coord._route_id_pending is True
+        assert coord._route_id_done is False
+        coord._route_store.async_save.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_view_keeps_the_route(self):
+        coord = _make_ssrc_coordinator()
+        coord._active_camera_slot = "cam2"
+        coord._route_refs = {"cam1": 0x0000, "cam2": 0xFFFFFFFFFFFFFFFF}
+        coord._route_id_pending = True
+        coord._route_id_attempts = 2  # last allowed frame
+
+        await coord._identify_route(0x0F0F0F0F0F0F0F0F)
+
+        assert coord._active_camera_slot == "cam2"
+        assert coord._route_id_pending is False
+        assert coord._route_confidence == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_view_falls_back_to_the_armed_expectation(self):
+        coord = _make_ssrc_coordinator()
+        coord._active_camera_slot = "cam1"
+        coord._camera_expectation = "cam2"
+        coord._route_refs = {"cam1": 0x0000, "cam2": 0xFFFFFFFFFFFFFFFF}
+        coord._route_id_pending = True
+        coord._route_id_attempts = 2  # last allowed frame
+
+        await coord._identify_route(0x0F0F0F0F0F0F0F0F)
+
+        assert coord._active_camera_slot == "cam2"
+        assert coord._camera_expectation is None
+        assert coord._route_confidence == "fallback"
+
+    @pytest.mark.asyncio
+    async def test_confirmed_route_is_persisted(self):
+        coord = _make_ssrc_coordinator()
+        coord._active_camera_slot = "cam1"
+        coord._route_refs = {"cam1": 0x0000, "cam2": 0xFFFFFFFFFFFFFFFF}
+        coord._route_id_pending = True
+
+        await coord._identify_route(0x0001)
+
+        coord._route_store.async_save.assert_awaited_once()
+        saved = coord._route_store.async_save.await_args.args[0]
+        assert saved["slot"] == "cam1"
+        assert saved["refs"] == {"cam1": 0x0000, "cam2": 0xFFFFFFFFFFFFFFFF}
 
 
 class TestCameraLabels:
@@ -2282,6 +2367,9 @@ class TestOpenEntrance:
         session.active = session_active
         coord._video_session = session
         coord._active_camera_slot = slot
+        # These tests exercise the routing choreography, not identification:
+        # the route is already known for this session.
+        coord._route_confidence = "measured"
         coord._config.doors = doors if doors is not None else [MagicMock()]
         coord.async_start_video = AsyncMock()
         coord.async_stop_video = AsyncMock()
@@ -2308,6 +2396,15 @@ class TestOpenEntrance:
         coord._client = None
         with pytest.raises(RuntimeError, match="Not connected"):
             await coord.async_open_entrance("Urbanización")
+
+    @pytest.mark.asyncio
+    async def test_unverified_route_never_opens(self):
+        """No measurement means no strike — a wrong door is worse than an error."""
+        coord = self._prepare(slot="cam1")
+        coord._route_confidence = "unknown"
+        with pytest.raises(RuntimeError, match="Could not verify"):
+            await coord.async_open_entrance("Urbanización")
+        coord.async_open_door.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_already_routed_opens_directly(self):

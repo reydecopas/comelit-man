@@ -89,6 +89,14 @@ async def _init_resource(hass: HomeAssistant, url: str, version: str) -> None:
         _LOGGER.debug("Added extra JS module: %s", url_versioned)
 
 
+CALIBRATE_CAMERA_SCHEMA = vol.Schema(
+    {
+        vol.Required("label"): cv.string,
+        vol.Optional("config_entry_id"): cv.string,
+    }
+)
+
+
 OPEN_ENTRANCE_SCHEMA = vol.Schema(
     {
         vol.Required("label"): cv.string,
@@ -129,6 +137,32 @@ async def _async_handle_open_entrance(hass: HomeAssistant, call: ServiceCall) ->
         raise HomeAssistantError(str(err)) from err
 
 
+async def _async_handle_calibrate_camera(hass: HomeAssistant, call: ServiceCall) -> None:
+    """Store the live view as the reference for an entrance camera slot."""
+    entry_id = call.data.get("config_entry_id")
+    if entry_id:
+        entry = hass.config_entries.async_get_entry(entry_id)
+        if entry is None or getattr(entry, "runtime_data", None) is None:
+            raise HomeAssistantError(f"Unknown or unloaded Comelit entry: {entry_id}")
+        targets = [entry]
+    else:
+        targets = [
+            e
+            for e in hass.config_entries.async_entries(DOMAIN)
+            if getattr(e, "runtime_data", None) is not None
+        ]
+        if len(targets) > 1:
+            raise HomeAssistantError(
+                "Several Comelit entries are loaded — pass config_entry_id"
+            )
+    if not targets:
+        raise HomeAssistantError("No loaded Comelit entries found")
+    try:
+        await targets[0].runtime_data.async_calibrate_camera(call.data["label"])
+    except RuntimeError as err:
+        raise HomeAssistantError(str(err)) from err
+
+
 async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
     """Register the Lovelace card static files and add them to resources."""
     version = getattr(hass.data.get("integrations", {}).get(DOMAIN), "version", "0")
@@ -144,6 +178,12 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         "open_entrance",
         partial(_async_handle_open_entrance, hass),
         schema=OPEN_ENTRANCE_SCHEMA,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        "calibrate_camera",
+        partial(_async_handle_calibrate_camera, hass),
+        schema=CALIBRATE_CAMERA_SCHEMA,
     )
     return True
 

@@ -189,6 +189,20 @@
           "description": "Target a specific Comelit entry when several are configured."
         }
       }
+    },
+    "calibrate_camera": {
+      "name": "Calibrate camera",
+      "description": "Store the current live view as the reference used to identify this entrance after every call.",
+      "fields": {
+        "label": {
+          "name": "Camera",
+          "description": "Camera label of the view that is streaming right now."
+        },
+        "config_entry_id": {
+          "name": "Config entry",
+          "description": "Target a specific Comelit entry when several are configured."
+        }
+      }
     }
   }
 }

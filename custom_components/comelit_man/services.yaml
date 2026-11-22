@@ -1,0 +1,36 @@
+open_entrance:
+  fields:
+    label:
+      required: true
+      example: "Urbanización"
+      selector:
+        text:
+    stop_after:
+      default: false
+      selector:
+        boolean:
+    relay:
+      required: false
+      selector:
+        number:
+          min: 0
+          max: 15
+          mode: box
+    config_entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: comelit_man
+
+calibrate_camera:
+  fields:
+    label:
+      required: true
+      example: "Urbanización"
+      selector:
+        text:
+    config_entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: comelit_man

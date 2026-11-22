@@ -21,6 +21,9 @@ def _make_selector(
     # Default: no label resolves (tests set explicit mappings when needed).
     coordinator.slot_for_label.return_value = None
     coordinator.async_toggle_camera_selection = AsyncMock(return_value=active_slot)
+    coordinator.async_wait_for_route = AsyncMock(return_value="measured")
+    coordinator.route_identification_pending = False
+    coordinator.route_references = {}
     coordinator.camera_ssrc = 0x11111111
     coordinator.camera_slot_map = {0x11111111: "cam1"}
 
@@ -69,6 +72,15 @@ class TestSelectOption:
         """With no known active camera, any choice advances the selector."""
         select, coordinator = _make_selector(active_slot=None)
         coordinator.slot_for_label.return_value = "cam1"
+        await select.async_select_option("A")
+        coordinator.async_toggle_camera_selection.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_unverifiable_view_still_advances_once(self):
+        """Manual control keeps working when the fingerprint cannot decide."""
+        select, coordinator = _make_selector(labels={"cam1": "A", "cam2": "B"}, active_slot="cam1")
+        coordinator.slot_for_label.return_value = "cam1"
+        coordinator.async_wait_for_route = AsyncMock(return_value="unknown")
         await select.async_select_option("A")
         coordinator.async_toggle_camera_selection.assert_awaited_once()
 

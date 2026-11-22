@@ -16,10 +16,17 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable
 
 from .protocol import HEADER_SIZE, ICONA_BRIDGE_PORT
+from .route_identifier import fingerprint
 
 _LOGGER = logging.getLogger(__name__)
 
 _MAX_CONSECUTIVE_ERRORS = 5
+
+# How many decoded frames are fingerprinted for entrance identification.
+# One good frame is enough, but the first ones after a relay switch can be
+# corrupt, so the coordinator may retry up to ROUTE_ID_MAX_ATTEMPTS times
+# within this budget. Hashing happens in the decoder's executor.
+_FRAME_CALLBACK_LIMIT = 8
 
 
 def _build_control_packet(control_req_id: int, udpm_token: int, seq: int) -> bytes:
@@ -129,6 +136,12 @@ class RtpReceiver:
         # coordinator to get notified when the value changes.
         self.video_ssrc: int | None = None
         self.on_video_ssrc: Callable[[int], None] | None = None
+
+        # Entrance route identification: the coordinator fingerprints one of
+        # the first decoded frames to learn which physical panel is routed.
+        # The hash is computed in the decoder's executor, never on the loop.
+        self.on_video_frame: Callable[[int], None] | None = None
+        self._frame_callback_budget = _FRAME_CALLBACK_LIMIT
 
         self._running = False
         self._control_seq = 0
@@ -642,6 +655,16 @@ class RtpReceiver:
                             frame_count += 1
                             self._latest_frame = jpeg_data
                             self._frame_event.set()
+                            if (
+                                self._frame_callback_budget > 0
+                                and self.on_video_frame is not None
+                            ):
+                                self._frame_callback_budget -= 1
+                                sample = await loop.run_in_executor(
+                                    None, fingerprint, jpeg_data
+                                )
+                                if sample is not None:
+                                    self.on_video_frame(sample)
                             if verbose and (frame_count <= 5 or frame_count % 50 == 0):
                                 _LOGGER.debug(
                                     "Frame %d: %dx%d (%d bytes JPEG), queue=%d",
