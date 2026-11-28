@@ -612,6 +612,11 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         self._route_id_candidate = None
         self._route_id_skip = skip_samples
         self._route_confidence = "unknown"
+        # A session that is already running may have spent its per-session
+        # sample budget on an earlier round; give the new round a full one.
+        session = self._video_session
+        if session is not None and session.rtp_receiver is not None:
+            session.rtp_receiver.reset_frame_callback_budget()
 
     def _on_video_frame(self, sample: int) -> None:
         """Fingerprint callback: identify the entrance from the next frame."""

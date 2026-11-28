@@ -44,6 +44,12 @@ LEARN_DISTANCE = 24
 # door, so such frames are not fingerprints at all.
 MIN_HASH_BITS = 4
 MAX_HASH_BITS = 60
+# A dead/noisy camera input (field-measured 2026-11-27: the far camera while
+# it warms up) hashes to an alternating-bit pattern. A real scene sits ~32
+# bits away from these on average, so this tight radius cannot reject a real
+# view; treating noise as a fingerprint would only burn the retry budget.
+NOISE_PATTERNS = (0xAAAAAAAAAAAAAAAA, 0x5555555555555555)
+NOISE_DISTANCE = 6
 
 
 def is_usable_hash(value: int) -> bool:
@@ -51,12 +57,21 @@ def is_usable_hash(value: int) -> bool:
     return MIN_HASH_BITS <= int(value).bit_count() <= MAX_HASH_BITS
 
 
+def is_noise_hash(value: int) -> bool:
+    """Return True for the alternating pattern of a dead/noisy input."""
+    return any(
+        (int(value) ^ pattern).bit_count() <= NOISE_DISTANCE
+        for pattern in NOISE_PATTERNS
+    )
+
+
 def fingerprint(jpeg: bytes) -> int | None:
     """Return the 64-bit dHash of a JPEG frame, or None if it cannot decode.
 
     ``None`` is also returned for degenerate frames (a black or uniform
-    picture): an all-zero hash would otherwise match any other blank frame
-    at distance 0.
+    picture) and for the alternating pattern of a dead/noisy input: an
+    all-zero hash would otherwise match any other blank frame at distance 0,
+    and noise would only burn the coordinator's retry budget.
     """
     try:
         from PIL import Image  # Pillow ships with Home Assistant
@@ -81,7 +96,7 @@ def fingerprint(jpeg: bytes) -> int | None:
             bits <<= 1
             if pixels[base + col] > pixels[base + col + 1]:
                 bits |= 1
-    if not is_usable_hash(bits):
+    if not is_usable_hash(bits) or is_noise_hash(bits):
         _LOGGER.debug(
             "Skipping uninformative frame (dHash 0x%016X, %d bits)",
             bits,

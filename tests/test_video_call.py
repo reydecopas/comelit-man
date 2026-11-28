@@ -2687,3 +2687,22 @@ class TestCallEndFloodGuard:
         # session ends instead of looping (each re-establish = relay click).
         assert session._inline_reestablish.await_count == 1
         assert ended == [1]
+
+
+class TestFrameCallbackBudget:
+    """The per-session sample budget must not starve a new identification."""
+
+    def test_reset_restores_a_full_budget(self):
+        from custom_components.comelit_man.rtp_receiver import (
+            _FRAME_CALLBACK_LIMIT,
+            RtpReceiver,
+        )
+
+        receiver = RtpReceiver("127.0.0.1")
+        receiver._frame_callback_budget = 0
+        receiver._last_frame_callback = 123.0
+
+        receiver.reset_frame_callback_budget()
+
+        assert receiver._frame_callback_budget == _FRAME_CALLBACK_LIMIT
+        assert receiver._last_frame_callback == 0.0

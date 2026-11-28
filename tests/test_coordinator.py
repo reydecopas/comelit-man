@@ -2186,6 +2186,22 @@ class TestRouteIdentification:
         coord._on_video_frame(0x0F0F0F0F0F0F0F0F)
         coord.config_entry.async_create_background_task.assert_called_once()
 
+    def test_new_identification_resets_sample_budget(self):
+        """An already-running session must serve the new round fresh samples.
+
+        The receiver caps how many frames it fingerprints per session; without
+        a reset, a second identification round on the same session would get
+        no frames at all and time out (field-seen 2026-11-27 after several
+        selector toggles in a row).
+        """
+        coord = _make_ssrc_coordinator()
+        receiver = MagicMock()
+        coord._video_session = MagicMock(rtp_receiver=receiver)
+
+        coord._begin_route_identification(skip_samples=2)
+
+        receiver.reset_frame_callback_budget.assert_called_once_with()
+
     @pytest.mark.asyncio
     async def test_disagreeing_samples_do_not_move_the_slot(self):
         """A tentative match followed by another slot keeps the route pending."""

@@ -22,11 +22,14 @@ _LOGGER = logging.getLogger(__name__)
 
 _MAX_CONSECUTIVE_ERRORS = 5
 
-# How many decoded frames are fingerprinted for entrance identification.
-# One good frame is enough, but the first ones after a relay switch can be
-# corrupt, so the coordinator may retry up to ROUTE_ID_MAX_ATTEMPTS times
-# within this budget. Hashing happens in the decoder's executor.
-_FRAME_CALLBACK_LIMIT = 8
+# How many *usable* samples are handed to the coordinator for entrance
+# identification. One good frame is enough, but a relay switch can land on a
+# dead/noisy input (field-measured: dHash 0xAAAA..., the far camera warming
+# up) and the coordinator retries up to ROUTE_ID_MAX_ATTEMPTS frames after
+# discarding the settling ones, so the budget must cover skip + attempts and
+# leave room for the odd uninformative frame. Hashing happens in the
+# decoder's executor, so this only bounds work, not latency.
+_FRAME_CALLBACK_LIMIT = 16
 # Only fingerprint a frame this often (seconds) to spread samples over the session.
 _FRAME_CALLBACK_INTERVAL = 1.0
 
@@ -663,12 +666,17 @@ class RtpReceiver:
                                 and self.on_video_frame is not None
                                 and (time.monotonic() - self._last_frame_callback) >= _FRAME_CALLBACK_INTERVAL
                             ):
-                                self._frame_callback_budget -= 1
                                 self._last_frame_callback = time.monotonic()
                                 sample = await loop.run_in_executor(
                                     None, fingerprint, jpeg_data
                                 )
+                                # Only a usable sample counts against the
+                                # budget: a black/covered frame is skipped by
+                                # the fingerprint and never reaches the
+                                # coordinator, so charging it would silently
+                                # starve the identification retries.
                                 if sample is not None:
+                                    self._frame_callback_budget -= 1
                                     self.on_video_frame(sample)
                             if verbose and (frame_count <= 5 or frame_count % 50 == 0):
                                 _LOGGER.debug(
@@ -777,6 +785,17 @@ class RtpReceiver:
             "RTP receiver stopped (received %d media packets)",
             self._media_packet_count,
         )
+
+    def reset_frame_callback_budget(self) -> None:
+        """Allow another identification round on this running session.
+
+        Called when the coordinator starts a new identification while the
+        session is already up (manual start, calibration, re-check): the
+        per-session sample budget may already be spent, which would leave the
+        new round with no frames at all.
+        """
+        self._frame_callback_budget = _FRAME_CALLBACK_LIMIT
+        self._last_frame_callback = 0.0
 
     async def get_jpeg_frame(self) -> bytes | None:
         """Wait for the next new JPEG frame and return it.

@@ -17,6 +17,7 @@ from custom_components.comelit_man.route_identifier import (  # noqa: E402
     fingerprint,
     hamming,
     identify,
+    is_noise_hash,
 )
 
 
@@ -89,10 +90,35 @@ class TestFingerprint:
         assert fingerprint(out.getvalue()) is None
 
 
+class TestNoise:
+    """A dead/noisy input must never become a route reference."""
+
+    def test_alternating_patterns_are_noise(self):
+        assert is_noise_hash(0xAAAAAAAAAAAAAAAA)
+        assert is_noise_hash(0x5555555555555555)
+        assert is_noise_hash(0xAAAAAAAA8AAAAAAA)
+
+    def test_real_views_are_not_noise(self):
+        assert not is_noise_hash(fingerprint(_jpeg("hedge")))
+        assert not is_noise_hash(fingerprint(_jpeg("street")))
+
+    def test_noisy_frame_is_not_a_fingerprint(self):
+        # 1px alternating columns are what the field saw from the far camera
+        # while it warmed up (dHash 0xAAAA...). It must be skipped, not hashed
+        # into a reference or counted as an inconclusive match.
+        image = Image.new("L", (9, 8))
+        pixels = image.load()
+        for y in range(8):
+            for x in range(9):
+                pixels[x, y] = 255 if x % 2 == 0 else 0
+        out = io.BytesIO()
+        image.save(out, format="PNG")
+        assert fingerprint(out.getvalue()) is None
+
+
 class TestIdentify:
     def test_no_references_never_guesses(self):
         assert identify(0b1010, {}) == (None, None)
-
     def test_exact_match(self):
         slot, distance = identify(0x0000, {"cam1": 0x0000, "cam2": 0xFFFFFFFF})
         assert (slot, distance) == ("cam1", 0)
