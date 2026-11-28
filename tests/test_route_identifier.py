@@ -34,6 +34,13 @@ def _jpeg(pattern: str, size: tuple[int, int] = (320, 240), quality: int = 85) -
         draw.rectangle([0, 0, width, int(height * 0.62)], fill=(30, 70, 30))
         draw.rectangle([0, int(height * 0.62), width, int(height * 0.86)], fill=(60, 110, 50))
         draw.rectangle([0, int(height * 0.86), width, height], fill=(200, 195, 180))
+        # A trunk breaks the horizontal bands: a real hedge has depth, and a
+        # frame made only of horizontal bands hashes to all-zero (which is not
+        # a usable fingerprint).
+        draw.rectangle(
+            [int(width * 0.30), 0, int(width * 0.42), int(height * 0.86)],
+            fill=(70, 50, 35),
+        )
     else:
         draw.rectangle([0, 0, int(width * 0.48), height], fill=(220, 220, 220))
         draw.rectangle([int(width * 0.48), 0, int(width * 0.62), height], fill=(150, 150, 150))
@@ -66,6 +73,21 @@ class TestFingerprint:
     def test_invalid_data_returns_none(self):
         assert fingerprint(b"not a jpeg") is None
 
+    def test_blank_frame_is_not_a_fingerprint(self):
+        # A black or uniform frame has no horizontal structure. Returning an
+        # all-zero hash would let a dark stream match any other blank frame at
+        # distance 0 and strike the wrong door.
+        image = Image.new("RGB", (320, 240), (0, 0, 0))
+        out = io.BytesIO()
+        image.save(out, format="JPEG", quality=85)
+        assert fingerprint(out.getvalue()) is None
+
+    def test_uniform_grey_frame_is_not_a_fingerprint(self):
+        image = Image.new("RGB", (320, 240), (128, 128, 128))
+        out = io.BytesIO()
+        image.save(out, format="JPEG", quality=85)
+        assert fingerprint(out.getvalue()) is None
+
 
 class TestIdentify:
     def test_no_references_never_guesses(self):
@@ -81,9 +103,9 @@ class TestIdentify:
         assert distance == 2
 
     def test_beyond_threshold_is_unknown(self):
-        at_threshold = (1 << MATCH_THRESHOLD) - 1  # exactly 14 differing bits
+        at_threshold = (1 << MATCH_THRESHOLD) - 1  # exactly MATCH_THRESHOLD bits
         assert identify(at_threshold, {"cam1": 0x0000})[0] == "cam1"
-        beyond = (1 << (MATCH_THRESHOLD + 1)) - 1  # 15 differing bits
+        beyond = (1 << (MATCH_THRESHOLD + 1)) - 1  # one bit past the threshold
         assert hamming(beyond, 0x0000) == MATCH_THRESHOLD + 1
         assert identify(beyond, {"cam1": 0x0000}) == (None, None)
 
@@ -103,3 +125,13 @@ class TestIdentify:
             None,
             None,
         )
+
+    def test_multiple_references_per_slot(self):
+        # cam1 keeps a day view and a night view; a night sample matches the
+        # closest of them instead of falling outside the threshold.
+        references = {"cam1": [0x0000, 0x00FF], "cam2": 0xFFFFFFFFFFFFFFFF}
+        assert hamming(0x00FE, 0x00FF) == 1
+        assert identify(0x00FE, references) == ("cam1", 1)
+
+    def test_empty_slot_reference_is_ignored(self):
+        assert identify(0x0000, {"cam1": [], "cam2": 0x3FFF}) == ("cam2", 14)

@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 from .auth import authenticate
 from .client import IconaBridgeClient
 from .const import (
+    CONF_APT_SUBADDRESS,
     CONF_CAMERA_LABEL_1,
     CONF_CAMERA_LABEL_2,
     CONF_CREATE_USER,
@@ -348,6 +349,7 @@ class ComelitLocalOptionsFlow(config_entries.OptionsFlowWithReload):
         current = self._config_entry.options.get(CONF_ENABLE_NOTIFICATIONS, True)
         label_1 = self._config_entry.options.get(CONF_CAMERA_LABEL_1) or DEFAULT_CAMERA_LABEL_1
         label_2 = self._config_entry.options.get(CONF_CAMERA_LABEL_2) or DEFAULT_CAMERA_LABEL_2
+        subaddress = self._config_entry.options.get(CONF_APT_SUBADDRESS) or ""
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema(
@@ -355,6 +357,7 @@ class ComelitLocalOptionsFlow(config_entries.OptionsFlowWithReload):
                     vol.Required(CONF_ENABLE_NOTIFICATIONS, default=current): bool,
                     vol.Optional(CONF_CAMERA_LABEL_1, default=label_1): str,
                     vol.Optional(CONF_CAMERA_LABEL_2, default=label_2): str,
+                    vol.Optional(CONF_APT_SUBADDRESS, default=str(subaddress)): str,
                 }
             ),
         )

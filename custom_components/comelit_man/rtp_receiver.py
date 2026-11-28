@@ -27,6 +27,8 @@ _MAX_CONSECUTIVE_ERRORS = 5
 # corrupt, so the coordinator may retry up to ROUTE_ID_MAX_ATTEMPTS times
 # within this budget. Hashing happens in the decoder's executor.
 _FRAME_CALLBACK_LIMIT = 8
+# Only fingerprint a frame this often (seconds) to spread samples over the session.
+_FRAME_CALLBACK_INTERVAL = 1.0
 
 
 def _build_control_packet(control_req_id: int, udpm_token: int, seq: int) -> bytes:
@@ -142,6 +144,7 @@ class RtpReceiver:
         # The hash is computed in the decoder's executor, never on the loop.
         self.on_video_frame: Callable[[int], None] | None = None
         self._frame_callback_budget = _FRAME_CALLBACK_LIMIT
+        self._last_frame_callback = 0.0
 
         self._running = False
         self._control_seq = 0
@@ -658,8 +661,10 @@ class RtpReceiver:
                             if (
                                 self._frame_callback_budget > 0
                                 and self.on_video_frame is not None
+                                and (time.monotonic() - self._last_frame_callback) >= _FRAME_CALLBACK_INTERVAL
                             ):
                                 self._frame_callback_budget -= 1
+                                self._last_frame_callback = time.monotonic()
                                 sample = await loop.run_in_executor(
                                     None, fingerprint, jpeg_data
                                 )

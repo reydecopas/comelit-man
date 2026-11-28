@@ -2615,7 +2615,9 @@ class TestTeardownMessages:
             order.append("cancel")
 
         with patch.object(type(session), "_send_teardown_messages", autospec=True) as fake:
-            fake.side_effect = lambda self: order.append("teardown") or asyncio.sleep(0)
+            fake.side_effect = (
+                lambda self, **kwargs: order.append("teardown") or asyncio.sleep(0)
+            )
             await session._cleanup()
         assert order[0] == "teardown"
 

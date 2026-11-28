@@ -21,6 +21,12 @@ CONF_CAMERA_LABEL_2 = "camera_2_label"
 DEFAULT_CAMERA_LABEL_1 = "Camera 1"
 DEFAULT_CAMERA_LABEL_2 = "Camera 2"
 
+# Optional override of the subaddress the panel reports for our apartment.
+# The panel's own value (4 on the field install) identifies the indoor unit
+# and never advances the entrance selector; the mobile-app identity (1) does.
+# Empty/absent keeps the panel value.
+CONF_APT_SUBADDRESS = "apt_subaddress"
+
 # Increment applied to our CTPP init timestamp to derive registration-renewal
 # ACK timestamps.  PCAP-verified on the 6701W (firmware 2.x).  Community notes
 # for other Comelit models report the same value for the 6742W, and one source

@@ -66,12 +66,14 @@
         "data": {
           "enable_notifications": "Enable doorbell notifications",
           "camera_1_label": "Label for camera 1",
-          "camera_2_label": "Label for camera 2"
+          "camera_2_label": "Label for camera 2",
+          "apt_subaddress": "Subaddress override"
         },
         "data_description": {
           "enable_notifications": "Receive doorbell ring and missed call events from the intercom",
           "camera_1_label": "Name shown for the first camera slot (e.g. \"Urbanization\"). The panel routes two cameras and two doors through a selector relay that advances on every call, so label these slots to match your installation.",
-          "camera_2_label": "Name shown for the second camera slot (e.g. \"House\"). See camera 1."
+          "camera_2_label": "Name shown for the second camera slot (e.g. \"House\"). See camera 1.",
+          "apt_subaddress": "Leave empty to use the panel's value (the indoor unit, which never advances the entrance selector). Set 1 to call with the mobile-app identity, which lets the selector relay advance between the two entrances."
         }
       }
     }

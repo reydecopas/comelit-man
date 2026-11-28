@@ -34,13 +34,13 @@ async def async_setup_entry(
 class ComelitCameraSelector(ComelitEntity, SelectEntity):
     """Select which entrance camera (and door) the panel streams and opens.
 
-    Panel routing model (field-observed 2026-11-20): the relay position is
-    physical state the panel never reports, and every new call advances it
-    one step (with the mobile subaddress), so the panel that answers cannot
-    be assumed. The first decoded frame of each session is fingerprinted and
-    compared against one reference per slot; that identification — persisted
-    across restarts — is what this entity shows. Selecting an option starts
-    a session if none is running and toggles at most once towards it.
+    Panel routing model (field-measured 2026-11-27): the relay position is
+    physical state the panel never reports, and it is not predictable from
+    the client side — a call can advance it or not. The decoded frames of
+    each session are fingerprinted and compared against the references per
+    slot; that identification — persisted across restarts — is what this
+    entity shows. Selecting an option starts a session if none is running
+    and toggles at most once towards it.
     """
 
     _attr_translation_key = "camera_selector"
@@ -72,12 +72,13 @@ class ComelitCameraSelector(ComelitEntity, SelectEntity):
     async def async_select_option(self, option: str) -> None:
         """Reach the requested camera with at most one selector toggle.
 
-        Panel model (field-observed 2026-11-20): a call advances the relay
-        one step, so reaching a camera needs a live session first — start
-        one, wait for its first frame to be identified, and toggle once only
-        when the confirmed panel is not the requested one. When the view is
-        inconclusive the relay is advanced anyway (this is manual control and
-        the live image is the ground truth), with a warning.
+        Panel model (field-measured 2026-11-27): a stop+start can advance
+        the relay one step, but not reliably, so reaching a camera needs a
+        live session first — start one, wait for its frames to be
+        identified, and toggle only when the confirmed panel is not the
+        requested one. When the view is inconclusive the relay is advanced
+        anyway (this is manual control and the live image is the ground
+        truth), with a warning.
         """
         slot = self.coordinator.slot_for_label(option)
         if slot is None:
@@ -113,6 +114,10 @@ class ComelitCameraSelector(ComelitEntity, SelectEntity):
             "route_references": {
                 slot: f"0x{reference:016X}"
                 for slot, reference in self.coordinator.route_references.items()
+            },
+            "route_extra_references": {
+                slot: [f"0x{reference:016X}" for reference in references]
+                for slot, references in self.coordinator.route_extra_references.items()
             },
         }
 

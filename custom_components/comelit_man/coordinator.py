@@ -28,6 +28,7 @@ from .channels import ChannelType
 from .client import IconaBridgeClient
 from .config_reader import get_device_config
 from .const import (
+    CONF_APT_SUBADDRESS,
     CONF_CAMERA_LABEL_1,
     CONF_CAMERA_LABEL_2,
     CONF_ENABLE_NOTIFICATIONS,
@@ -41,7 +42,13 @@ from .exceptions import AuthenticationError, DoorOpenError
 from .go2rtc_helper import get_go2rtc
 from .models import DeviceConfig, Door, PushEvent
 from .push import register_push, send_push_keepalive
-from .route_identifier import LEARN_DISTANCE, fingerprint, hamming, identify
+from .route_identifier import (
+    LEARN_DISTANCE,
+    fingerprint,
+    hamming,
+    identify,
+    is_usable_hash,
+)
 from .rtsp_server import LocalRtspServer
 from .video_call import VideoCallSession
 from .vip_listener import VipEventListener
@@ -59,20 +66,39 @@ MISSED_CALL_WINDOW = 45.0
 # Hardware settling cooldown between video sessions (seconds).
 # Field-measured 2026-11-20: 1.5 s makes the panel serve a corrupt stream
 # after a selector switch; 3 s worked, 5-6 s leaves a safe margin.
+# This is the guard for automatic restarts (CALL_END/timeout): waiting keeps
+# the panel from cycling and the physical relay from clicking every 2-3 s.
 RELAY_SETTLE_COOLDOWN = 5.5
+
+# Intentional selector switches: a call placed 0.02 s or 0.35 s after
+# RELEASE keeps the old entrance, so a switch waits for the panel to tear the
+# previous call down (RELAY_SETTLE_COOLDOWN). The flip is not fully
+# deterministic from the client side (field-measured 2026-11-27: a call from
+# idle sometimes advances it and sometimes not), so callers always verify the
+# new view instead of trusting the advance.
+IMMEDIATE_RESWITCH_SETTLE = RELAY_SETTLE_COOLDOWN
 
 # Entrance route persistence: the relay position is physical state the panel
 # does not report, so it survives integration restarts. One fingerprint per
-# camera slot is learned from the first frame of each panel.
+# camera slot is learned from the first frame of each panel; extra references
+# cover the same entrance seen under different light (day vs IR/night).
 ROUTE_STORE_VERSION = 1
 ROUTE_SLOTS = ("cam1", "cam2")
+ROUTE_EXTRA_REF_MAX = 3
+# A measured frame this far from the slot's existing references is a
+# different view of the same entrance (typically day vs night): keep it.
+ROUTE_REF_APPEND_MIN = 8
+# Do not store a near-duplicate of a reference already known.
+ROUTE_REF_DUPLICATE_DISTANCE = 4
 # How many decoded frames an unidentified session may consume before the
 # route stays "unknown" (a corrupt first frame after a switch is common).
-ROUTE_ID_MAX_ATTEMPTS = 3
+# A switch spends two samples on the relay settling and two more confirming
+# the new view, so the budget must cover both phases plus retries.
+ROUTE_ID_MAX_ATTEMPTS = 8
 
 # open_entrance choreography: how long to wait for the (new) camera's first
 # video SSRC after a start/toggle, and how often to poll the active slot.
-# The 5.5 s relay settle plus panel re-arm fits comfortably in this window.
+# The immediate re-call plus panel re-arm fits comfortably in this window.
 CAMERA_SWITCH_TIMEOUT = 20.0
 CAMERA_WAIT_POLL = 0.25
 
@@ -213,10 +239,17 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
             hass, ROUTE_STORE_VERSION, f"{DOMAIN}.route.{entry.entry_id}"
         )
         self._route_refs: dict[str, int] = {}
+        self._route_extra_refs: dict[str, list[int]] = {}
         self._route_store_loaded: bool = False
         self._route_id_pending: bool = False
         self._route_id_done: bool = False
         self._route_id_attempts: int = 0
+        # First matching slot; a second, agreeing sample is required before
+        # accepting a "measured" match (early frames after a switch can still
+        # show the previous entrance).
+        self._route_id_candidate: str | None = None
+        # Frames to discard right after a selector switch (relay settling).
+        self._route_id_skip: int = 0
         # How the current slot was decided: "measured" (reference match),
         # "learned" (second entrance seen for the first time), "bootstrap"
         # (first reference, trusting the panel's idle default), "fallback"
@@ -269,6 +302,30 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         )
         return ts
 
+    def _apply_config_overrides(self, config: DeviceConfig) -> None:
+        """Apply the options that override values reported by the panel.
+
+        ``apt_subaddress`` is the only one: the panel reports the indoor
+        unit's subaddress (4 on the field install), which never advances the
+        entrance selector. The mobile-app identity (1) does, so the user can
+        switch without patching the integration.
+        """
+        raw = self.config_entry.options.get(CONF_APT_SUBADDRESS)
+        if raw in (None, ""):
+            return
+        try:
+            sub = int(raw)
+        except (TypeError, ValueError):
+            _LOGGER.warning("Ignoring invalid subaddress option: %r", raw)
+            return
+        if sub != config.apt_subaddress:
+            _LOGGER.info(
+                "Subaddress override: %d (panel reports %d)",
+                sub,
+                config.apt_subaddress,
+            )
+        config.apt_subaddress = sub
+
     async def async_setup(self) -> None:
         """Connect, authenticate, fetch config, and register for push."""
         # Restore the last known entrance route before any entity is added,
@@ -280,6 +337,7 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         try:
             await authenticate(client, self.token)
             self._config = await get_device_config(client)
+            self._apply_config_overrides(self._config)
             await register_push(client, self._config, self._on_push_event)
         except Exception:
             await client.disconnect()
@@ -360,6 +418,7 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
             await client.connect()
             await authenticate(client, self.token)
             self._config = await get_device_config(client)
+            self._apply_config_overrides(self._config)
             await register_push(client, self._config, self._on_push_event)
         except Exception:
             # Clean up the new client if setup fails partway through
@@ -465,6 +524,11 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         return dict(self._route_refs)
 
     @property
+    def route_extra_references(self) -> dict[str, list[int]]:
+        """Return the extra (day/night) fingerprints learned per slot."""
+        return {slot: list(refs) for slot, refs in self._route_extra_refs.items()}
+
+    @property
     def route_identification_pending(self) -> bool:
         """True while the session's first frame has not been identified yet."""
         return self._route_id_pending
@@ -530,16 +594,34 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
             "comelit-camera-slot-change",
         )
 
-    def _begin_route_identification(self) -> None:
-        """Let the next session's first decoded frames decide the active slot."""
+    def _begin_route_identification(self, *, skip_samples: int = 2) -> None:
+        """Let the next session's decoded frames decide the active slot.
+
+        ``skip_samples`` discards the first frames of the session. The panel
+        moves the selector relay during call setup (field-measured
+        2026-11-27: the first decoded frame arrives on the *old* entrance and
+        the switch is visible ~1 s later), so fingerprinting the first frames
+        would learn/confirm the wrong door. The default discards the first two
+        callbacks (~2 s at one sample per second), which lands after the
+        switch; the confirmation logic then requires an agreeing second
+        sample before accepting a measured match.
+        """
         self._route_id_pending = True
         self._route_id_done = False
         self._route_id_attempts = 0
+        self._route_id_candidate = None
+        self._route_id_skip = skip_samples
         self._route_confidence = "unknown"
 
     def _on_video_frame(self, sample: int) -> None:
         """Fingerprint callback: identify the entrance from the next frame."""
         if self._route_id_done:
+            return
+        if self._route_id_skip > 0:
+            self._route_id_skip -= 1
+            _LOGGER.debug(
+                "Entrance route: discarding a settling frame after the switch"
+            )
             return
         self._route_id_done = True
         self.config_entry.async_create_background_task(
@@ -589,7 +671,18 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         """
         await self._ensure_route_store_loaded()
         self._route_id_attempts += 1
-        slot, distance = identify(sample, self._route_refs)
+        references: dict[str, int | list[int]] = {
+            slot: [reference, *self._route_extra_refs.get(slot, [])]
+            for slot, reference in self._route_refs.items()
+        }
+        slot, distance = identify(sample, references)
+        _LOGGER.debug(
+            "Entrance route: frame %d hash=0x%016X best=%s distance=%s",
+            self._route_id_attempts,
+            sample,
+            slot,
+            distance,
+        )
         confidence = "measured"
         if slot is None and not self._route_refs:
             bootstrap = self._active_camera_slot or "cam1"
@@ -604,11 +697,13 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
             )
         elif slot is None and len(self._route_refs) == 1:
             known_slot, known_ref = next(iter(self._route_refs.items()))
-            if hamming(sample, known_ref) >= LEARN_DISTANCE:
+            known_refs = [known_ref, *self._route_extra_refs.get(known_slot, [])]
+            known_distance = min(hamming(sample, reference) for reference in known_refs)
+            if known_distance >= LEARN_DISTANCE:
                 missing = "cam2" if known_slot == "cam1" else "cam1"
                 self._route_refs[missing] = sample
                 slot = missing
-                distance = hamming(sample, known_ref)
+                distance = known_distance
                 confidence = "learned"
                 _LOGGER.info(
                     "Entrance route: learned the second reference for %s "
@@ -641,7 +736,28 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                 f"assuming {fallback}" if fallback else "route unknown",
             )
         else:
+            if confidence == "measured" and self._route_id_candidate != slot:
+                # First sighting of this slot. A single frame is not enough:
+                # right after a switch the panel can still deliver frames from
+                # the previous entrance, which would confirm the wrong door.
+                self._route_id_candidate = slot
+                if self._route_id_attempts < ROUTE_ID_MAX_ATTEMPTS:
+                    self._route_id_done = False
+                    _LOGGER.debug(
+                        "Entrance route: frame %d tentative %s (distance %s), "
+                        "waiting for an agreeing sample",
+                        self._route_id_attempts,
+                        slot,
+                        distance,
+                    )
+                    return
+            self._route_id_candidate = None
             self._camera_expectation = None
+            if confidence == "measured":
+                # Same entrance under different light (day vs IR/night) is a
+                # new reference, not a new slot: keep it so the next session
+                # at this time of day identifies instead of failing.
+                self._remember_view(slot, sample, distance)
             if slot != self._active_camera_slot:
                 self._set_active_slot(
                     slot, source=f"identified ({confidence}, distance {distance})"
@@ -658,6 +774,26 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         self._route_confidence = confidence
         self._route_id_pending = False
         await self._save_route_state()
+
+    def _remember_view(self, slot: str, sample: int, distance: int | None) -> None:
+        """Keep a distinct view (day vs IR/night) of an identified slot."""
+        if distance is None or distance < ROUTE_REF_APPEND_MIN:
+            return
+        existing = [self._route_refs.get(slot), *self._route_extra_refs.get(slot, [])]
+        if any(
+            reference is not None
+            and hamming(sample, reference) <= ROUTE_REF_DUPLICATE_DISTANCE
+            for reference in existing
+        ):
+            return
+        extras = self._route_extra_refs.setdefault(slot, [])
+        extras.append(sample)
+        del extras[:-ROUTE_EXTRA_REF_MAX]
+        _LOGGER.debug(
+            "Entrance route: stored an extra %s reference (distance %s)",
+            slot,
+            distance,
+        )
 
     async def async_calibrate_camera(self, label: str) -> None:
         """Store the live view as the reference for a camera slot.
@@ -678,7 +814,16 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         if sample is None:
             raise RuntimeError("Could not read the current frame")
         await self._ensure_route_store_loaded()
-        self._route_refs[slot] = sample
+        if slot not in self._route_refs:
+            self._route_refs[slot] = sample
+        else:
+            extras = self._route_extra_refs.setdefault(slot, [])
+            if sample != self._route_refs[slot] and sample not in extras:
+                # Keep the existing reference: an explicit calibration adds
+                # the view being shown (typically the night one) instead of
+                # discarding the previous one.
+                extras.append(sample)
+                del extras[:-ROUTE_EXTRA_REF_MAX]
         self._route_id_pending = False
         self._route_id_done = True
         self._route_confidence = "measured"
@@ -702,15 +847,24 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         if slot in ROUTE_SLOTS:
             self._active_camera_slot = slot
         refs = data.get("refs") or {}
+        # Filter out degenerate hashes (all-zero, uniform frames) that would
+        # incorrectly identify a dark camera as a specific entrance.
         self._route_refs = {
             key: int(value)
             for key, value in refs.items()
-            if key in ROUTE_SLOTS and isinstance(value, int | float)
+            if key in ROUTE_SLOTS and isinstance(value, int | float) and is_usable_hash(int(value))
+        }
+        extra = data.get("extra_refs") or {}
+        self._route_extra_refs = {
+            key: [int(item) for item in value if is_usable_hash(int(item))]
+            for key, value in extra.items()
+            if key in ROUTE_SLOTS and isinstance(value, list)
         }
         _LOGGER.debug(
-            "Entrance route restored: slot=%s, references=%s",
+            "Entrance route restored: slot=%s, references=%s, extra=%s",
             self._active_camera_slot,
             sorted(self._route_refs),
+            {slot: len(items) for slot, items in self._route_extra_refs.items()},
         )
 
     async def _save_route_state(self) -> None:
@@ -720,6 +874,10 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                 {
                     "slot": self._active_camera_slot,
                     "refs": dict(self._route_refs),
+                    "extra_refs": {
+                        slot: list(items)
+                        for slot, items in self._route_extra_refs.items()
+                    },
                 }
             )
         except Exception:
@@ -728,24 +886,28 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
     def _arm_outbound_camera_expectation(self) -> None:
         """Prepare route identification for an outbound (non-toggle) start.
 
-        A fresh call does not reset the relay: it answers on whichever panel
-        is currently routed, and with the mobile subaddress every call
-        advances it one step (field-observed 2026-11-20). So the display
-        keeps the last known route and the first frame's fingerprint decides;
-        the armed expectation is only the fallback when identification fails.
+        The relay position is not deterministic from the client side: a plain
+        call from idle sometimes advances it and sometimes does not
+        (field-measured 2026-11-27), independent of how long the panel was
+        idle. The first usable decoded frames therefore decide the slot; the
+        armed expectation (last known route) is only the fallback when
+        identification fails, and callers that must strike a door refuse on
+        that fallback.
         """
         if self._camera_expectation is None:
             self._camera_expectation = self._active_camera_slot
         self._begin_route_identification()
 
     async def async_toggle_camera_selection(self) -> str | None:
-        """Advance (or re-anchor) the entrance panel's camera/door routing.
+        """Advance the entrance panel's camera/door routing by one step.
 
-        Panel model (field-observed 2026-11-20): every new call advances the
-        selector relay one step (with the mobile subaddress), and a fresh
-        call from idle answers on whichever panel is routed — neither is
-        predictable from the protocol, so the next session's first frame is
-        fingerprinted to learn where the relay really is.
+        Panel model (field-measured 2026-11-26/27): a call placed on a panel
+        that has fully torn down (media stopped) usually advances the relay,
+        while re-calling 0.02 s or 0.35 s after RELEASE keeps the old entrance.
+        The panel is not fully deterministic — a call from idle can advance it
+        too, and a switch can land on a dead/noisy camera input — so the relay
+        position is never assumed: the new session's frames are fingerprinted
+        and callers must verify before striking a door.
 
         Returns the active slot after the toggle ("cam1"/"cam2"), or None
         if the new camera's SSRC hasn't been seen yet.
@@ -757,14 +919,23 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         if self._video_session is not None:
             await self.async_stop_video()
         if had_session:
-            # Call held live → the panel advances the relay to the other camera.
+            # A call placed on the settled panel flips the relay to the other
+            # entrance; this is only the fallback if identification fails.
             self._camera_expectation = {"cam1": "cam2", "cam2": "cam1"}.get(pre)
         else:
             # From idle, keep the last known route and let the first frame
             # decide; "cam1" is only the bootstrap when nothing is known yet.
             self._camera_expectation = pre if pre in ("cam1", "cam2") else "cam1"
-        self._begin_route_identification()
-        await self.async_start_video(auto_timeout=True, by_user=True, force_restart=True)
+        # The first frames after the call can still belong to the old
+        # entrance (the panel switches during call setup): skip them instead
+        # of learning the wrong door.
+        self._begin_route_identification(skip_samples=2)
+        await self.async_start_video(
+            auto_timeout=True,
+            by_user=True,
+            force_restart=True,
+            relay_settle=IMMEDIATE_RESWITCH_SETTLE,
+        )
         return self._active_camera_slot
 
     async def async_open_entrance(
@@ -783,8 +954,10 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
            (one stop + force-restart call = one relay click) and wait for the
            new view to be identified. Bounded to 3 advances (two slots plus
            margin) so a misbehaving panel cannot hammer the relay.
-        4. Fire the door relay on the active call (0x1840/0x000D when video is
-           flowing; the standard open path otherwise).
+        4. Fire the door relay: `async_open_door` ends the session first and
+           uses the OPEN + CONFIRM sequence (the in-call frames did not
+           actuate the relay in field tests; the physical relay keeps the
+           route when the call ends).
         5. ``stop_after`` ends the session; by default it stays on (its own
            120 s timeout applies) so you can keep watching the entrance.
         """
@@ -821,15 +994,24 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
             await self.async_toggle_camera_selection()
             confidence = await self._wait_for_route_identification()
             if confidence in ("unknown", "fallback", "timeout"):
-                raise RuntimeError(
-                    "Could not verify the entrance after switching "
-                    f"({confidence}) — not opening."
+                # The relay moved but the encoder came up on a dead/noisy
+                # input (field-seen 2026-11-27: the urbanización camera can
+                # take a while to warm up). Retry the advance instead of
+                # giving up: the loop bound is what keeps the relay from
+                # being hammered, and a strike still requires a verified view.
+                _LOGGER.warning(
+                    "open_entrance: switch %d produced no verifiable view "
+                    "(%s) — retrying",
+                    attempt + 1,
+                    confidence,
                 )
+                continue
             if self._active_camera_slot == target:
                 break
         else:
             raise RuntimeError(
-                f"Selector did not reach {label!r} — active camera is {self._active_camera_slot}"
+                f"Selector did not reach {label!r} — active camera is "
+                f"{self._active_camera_slot} (last check: {confidence})"
             )
 
         doors = self._config.doors
@@ -871,14 +1053,17 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
     async def async_open_door(self, door: Door, *, relay: int | None = None) -> None:
         """Open a door.
 
-        Two paths:
+        Always uses door.open_door(): reuses the CTPP channel that is open
+        (VIP listener or video session, fast path) or opens a transient one,
+        and runs the OPEN + CONFIRM → door_init → OPEN + CONFIRM sequence.
 
-        1. Video active — a single 0x1840/0x000D on the video CTPP channel
-           with the live session counter (upstream PROTOCOL.md §6, restored
-           verbatim from 2af72a6 for field testing).
-        2. No video — door.open_door(): reuses the VIP listener's CTPP
-           channel when open (fast path) or opens a transient one, and runs
-           the OPEN + CONFIRM → door_init → OPEN + CONFIRM sequence.
+        The in-call frames (0x1840/0x000D and the mid-call OPEN_DOOR
+        variants) are not used: field tests on 2026-11-22 with an active
+        session show the panel answers/retransmits its own 0x1800 but the
+        strike never fires at either entrance, while the same sequence
+        fires on every press with no session. The selector relay is
+        physical state, so ending the call first does not move the route:
+        the strike still targets the entrance that was streaming.
 
         ``relay`` overrides the door's output index in the strike frame
         (field-test knob for the second entrance's relay).
@@ -888,10 +1073,8 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         if relay is not None:
             door = dataclasses.replace(door, output_index=relay)
         if self._video_session and self._video_session.active:
-            our_addr = f"{self._config.apt_address}{self._config.apt_subaddress}"
-            entrance_addr = self._config.caller_address or our_addr
-            await self._video_session.async_open_door_on_ctpp(our_addr, entrance_addr, door.output_index)
-            return
+            _LOGGER.info("Door open requested with video active — ending the call before the strike")
+            await self.async_stop_video()
         try:
             await open_door(self.host, self.port, self.token, self._client, self._config, door)
         except DoorOpenError as err:
@@ -904,6 +1087,7 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         auto_timeout: bool = True,
         by_user: bool = False,
         force_restart: bool = False,
+        relay_settle: float | None = None,
     ) -> VideoCallSession:
         """Start a video call session.
 
@@ -969,9 +1153,10 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
             await self.async_stop_video()
 
             # Enforce hardware settling cooldown so the physical relay doesn't get hammered
+            settle = RELAY_SETTLE_COOLDOWN if relay_settle is None else relay_settle
             elapsed = time.monotonic() - self._last_video_stop_mono
-            if elapsed < RELAY_SETTLE_COOLDOWN:
-                wait_time = RELAY_SETTLE_COOLDOWN - elapsed
+            if elapsed < settle:
+                wait_time = settle - elapsed
                 _LOGGER.debug("Hardware relay settling cooldown: waiting %.2fs", wait_time)
                 await asyncio.sleep(wait_time)
 
